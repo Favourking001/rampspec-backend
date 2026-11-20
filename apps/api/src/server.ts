@@ -19,6 +19,11 @@ import {
   type Run,
   type RunRepository,
 } from "../../../packages/platform/src/index.js";
+import {
+  validateAndGenerateRequestId,
+  withRequestContext,
+} from "../../../packages/platform/src/observability/request-context.js";
+import { buildProblem } from "../../../packages/platform/src/observability/problem-builder.js";
 
 const version = "0.1.0";
 const maximumBodyBytes = 32_768;
@@ -218,9 +223,13 @@ function sendJson(
   response: ServerResponse,
   status: number,
   value: unknown,
+  requestId?: string,
 ): void {
   response.statusCode = status;
   response.setHeader("Content-Type", "application/json; charset=utf-8");
+  if (requestId) {
+    response.setHeader("x-request-id", requestId);
+  }
   response.end(`${JSON.stringify(value)}\n`);
 }
 
@@ -249,77 +258,101 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> => {
-    applyCors(request, response);
-    try {
-      const url = new URL(request.url ?? "/", "http://localhost");
-      if (request.method === "OPTIONS") {
-        response.statusCode = 204;
-        response.end();
-        return;
-      }
-      if (request.method === "GET" && url.pathname === "/health") {
-        sendJson(response, 200, {
-          persistence: "json-file",
-          status: "ok",
-          version,
-        });
-        return;
-      }
-      if (request.method === "GET" && url.pathname === "/version") {
-        sendJson(response, 200, { api: "v1", version });
-        return;
-      }
-      if (request.method === "POST" && url.pathname === "/v1/reference-runs") {
-        const body = await readJson(request);
-        if (!body || typeof body !== "object" || Array.isArray(body))
-          throw new Error("JSON object required.");
-        const record = body as Record<string, unknown>;
-        const organizationId = request.headers["x-rampspec-organization"];
-        const idempotencyKey = request.headers["idempotency-key"];
-        if (typeof organizationId !== "string")
-          throw new Error("X-RampSpec-Organization is required.");
-        if (typeof idempotencyKey !== "string")
-          throw new Error("Idempotency-Key is required.");
-        const effectiveConfig =
-          record.effectiveConfig &&
-          typeof record.effectiveConfig === "object" &&
-          !Array.isArray(record.effectiveConfig)
-            ? (record.effectiveConfig as Readonly<Record<string, unknown>>)
-            : undefined;
-        const result = await executor.execute(organizationId, idempotencyKey, {
-          ...(effectiveConfig ? { effectiveConfig } : {}),
-          projectId: requireString(record, "projectId"),
-          suiteId: requireString(record, "suiteId"),
-          suiteVersion: requireString(record, "suiteVersion"),
-          targetId: requireString(record, "targetId"),
-          targetOrigin: requireString(record, "targetOrigin"),
-        });
-        sendJson(response, 201, result);
-        return;
-      }
-      const match = /^\/v1\/reference-runs\/(run_[0-9a-f-]+)$/u.exec(
-        url.pathname,
-      );
-      if (request.method === "GET" && match?.[1]) {
-        const organizationId = request.headers["x-rampspec-organization"];
-        if (typeof organizationId !== "string")
-          throw new Error("X-RampSpec-Organization is required.");
-        const record = await executor.find(organizationId, match[1]);
-        if (!record) {
-          sendJson(response, 404, { status: 404, title: "Run not found" });
+    // Extract and validate request ID
+    const inboundId = request.headers["x-request-id"];
+    const requestId = validateAndGenerateRequestId(
+      Array.isArray(inboundId) ? inboundId[0] : inboundId,
+    );
+
+    // Set response header immediately
+    response.setHeader("x-request-id", requestId);
+
+    // Run handler within request context
+    await withRequestContext({ requestId }, async () => {
+      applyCors(request, response);
+      try {
+        const url = new URL(request.url ?? "/", "http://localhost");
+        if (request.method === "OPTIONS") {
+          response.statusCode = 204;
+          response.end();
           return;
         }
-        sendJson(response, 200, record);
-        return;
+        if (request.method === "GET" && url.pathname === "/health") {
+          sendJson(response, 200, {
+            persistence: "json-file",
+            status: "ok",
+            version,
+          });
+          return;
+        }
+        if (request.method === "GET" && url.pathname === "/version") {
+          sendJson(response, 200, { api: "v1", version });
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/v1/reference-runs") {
+          const body = await readJson(request);
+          if (!body || typeof body !== "object" || Array.isArray(body))
+            throw new Error("JSON object required.");
+          const record = body as Record<string, unknown>;
+          const organizationId = request.headers["x-rampspec-organization"];
+          const idempotencyKey = request.headers["idempotency-key"];
+          if (typeof organizationId !== "string")
+            throw new Error("X-RampSpec-Organization is required.");
+          if (typeof idempotencyKey !== "string")
+            throw new Error("Idempotency-Key is required.");
+          const effectiveConfig =
+            record.effectiveConfig &&
+            typeof record.effectiveConfig === "object" &&
+            !Array.isArray(record.effectiveConfig)
+              ? (record.effectiveConfig as Readonly<Record<string, unknown>>)
+              : undefined;
+          const result = await executor.execute(organizationId, idempotencyKey, {
+            ...(effectiveConfig ? { effectiveConfig } : {}),
+            projectId: requireString(record, "projectId"),
+            suiteId: requireString(record, "suiteId"),
+            suiteVersion: requireString(record, "suiteVersion"),
+            targetId: requireString(record, "targetId"),
+            targetOrigin: requireString(record, "targetOrigin"),
+          });
+          sendJson(response, 201, result);
+          return;
+        }
+        const match = /^\/v1\/reference-runs\/(run_[0-9a-f-]+)$/u.exec(
+          url.pathname,
+        );
+        if (request.method === "GET" && match?.[1]) {
+          const organizationId = request.headers["x-rampspec-organization"];
+          if (typeof organizationId !== "string")
+            throw new Error("X-RampSpec-Organization is required.");
+          const record = await executor.find(organizationId, match[1]);
+          if (!record) {
+            const problem = buildProblem({
+              type: "https://rampspec.io/error/not-found",
+              title: "Run not found",
+              status: 404,
+            });
+            sendJson(response, 404, problem);
+            return;
+          }
+          sendJson(response, 200, record);
+          return;
+        }
+        const problem = buildProblem({
+          type: "https://rampspec.io/error/not-found",
+          title: "Route not found",
+          status: 404,
+        });
+        sendJson(response, 404, problem);
+      } catch (error) {
+        const problem = buildProblem({
+          type: "https://rampspec.io/error/invalid-request",
+          title: "Request rejected",
+          status: 400,
+          detail: error instanceof Error ? error.message : "Invalid request.",
+        });
+        sendJson(response, 400, problem);
       }
-      sendJson(response, 404, { status: 404, title: "Route not found" });
-    } catch (error) {
-      sendJson(response, 400, {
-        detail: error instanceof Error ? error.message : "Invalid request.",
-        status: 400,
-        title: "Request rejected",
-      });
-    }
+    });
   };
 }
 

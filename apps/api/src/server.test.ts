@@ -154,4 +154,79 @@ describe("reference run API", () => {
       detail: "Target origin is not approved for reference runs.",
     });
   });
+
+  it("propagates valid request IDs in response headers", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const customId = "custom_req_12345";
+    const response = await fetch(`${started.url}/health`, {
+      headers: { "x-request-id": customId },
+    });
+
+    expect(response.headers.get("x-request-id")).toBe(customId);
+  });
+
+  it("generates request ID when missing", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const response = await fetch(`${started.url}/health`);
+    const id = response.headers.get("x-request-id");
+
+    expect(id).toBeDefined();
+    expect(id).toMatch(/^req_/);
+  });
+
+  it("rejects invalid request IDs and generates new ones", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const response = await fetch(`${started.url}/health`, {
+      headers: { "x-request-id": "invalid\nheader\ninjection" },
+    });
+
+    const id = response.headers.get("x-request-id");
+    expect(id).not.toBe("invalid\nheader\ninjection");
+    expect(id).toMatch(/^req_/);
+  });
+
+  it("includes request ID in problem responses", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const customId = "debug_req_99999";
+    const response = await fetch(`${started.url}/v1/reference-runs`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-request-id": customId,
+      },
+      body: JSON.stringify({}),
+    });
+
+    expect(response.status).toBe(400);
+    const problem = (await response.json()) as { requestId?: string };
+    expect(problem.requestId).toBe(customId);
+  });
 });
